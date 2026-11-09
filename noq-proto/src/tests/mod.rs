@@ -5297,6 +5297,105 @@ fn throughput() -> TestResult {
     Ok(())
 }
 
+/// BBR's window during a quiet spell with only heartbeats, over a whole
+/// connection: 10 s of bulk sending on a 10 Mbit/s link with a 90 ms round
+/// trip, 40 s with only a 100-byte write every 500 ms, then 10 s of bulk
+/// sending again. The window should not collapse during the spell or just
+/// after it. Without the fix it fell to about 5 packets; ProbeRTT dips go to
+/// about a fifth of the window, so the check allows down to a sixteenth.
+#[test]
+fn bbr_window_holds_through_a_spell_of_heartbeats() -> TestResult {
+    const RATE: u64 = 10_000_000 / 8;
+    const S: Duration = Duration::from_secs(1);
+    let (bulk_end, spell_end, end) = (10 * S, 50 * S, 60 * S);
+
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .congestion_controller_factory(Arc::new(crate::congestion::Bbr3Config::default()))
+        .receive_window(VarInt::from_u32(64 << 20))
+        .stream_receive_window(VarInt::from_u32(16 << 20))
+        .send_window(64 << 20);
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .with_routes(BwLimitedRouting::new(
+            Pair::CLIENT_ADDR,
+            Pair::SERVER_ADDR,
+            Instant::now(),
+            BwLimitConfig {
+                bytes_per_second: RATE,
+                buffer_size: 256 << 10,
+                latency: Duration::from_millis(45),
+            },
+        ))
+        .connect();
+
+    let start = pair.time;
+    let bulk = pair.streams(Client).open(Dir::Uni).unwrap();
+    let beats = pair.streams(Client).open(Dir::Uni).unwrap();
+    let mut accepted = Vec::new();
+    let mut next_beat = start + bulk_end;
+    let mut next_sample = start;
+    // (second, cwnd) once a second
+    let mut cwnds: Vec<(u64, u64)> = Vec::new();
+    loop {
+        let elapsed = pair.time.saturating_duration_since(start);
+        if elapsed >= end {
+            break;
+        }
+        let spell = elapsed >= bulk_end && elapsed < spell_end;
+        if spell {
+            if pair.time >= next_beat {
+                pair.send_stream(Client, beats).write(&ZEROES[..100])?;
+                next_beat += S / 2;
+            }
+        } else {
+            // Always backlogged: write until the stream is blocked.
+            loop {
+                match pair.send_stream(Client, bulk).write(&ZEROES) {
+                    Ok(_) => {}
+                    Err(WriteError::Blocked) => break,
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+        }
+        while let Some(id) = pair.streams(Server).accept(Dir::Uni) {
+            accepted.push(id);
+        }
+        for id in &accepted {
+            let mut n = 0;
+            recv_bytes(pair.recv_stream(Server, *id), &mut n);
+        }
+        if pair.time >= next_sample {
+            let cwnd = pair.path_stats(Client, PathId::ZERO).unwrap().cwnd;
+            cwnds.push((elapsed.as_secs(), cwnd));
+            next_sample += S;
+        }
+        pair.drive_client();
+        pair.drive_server();
+        // Next event, but never past the next heartbeat or sample.
+        let wake = util::min_opt(pair.client.next_wakeup(), pair.server.next_wakeup());
+        let mut t = wake.unwrap_or(pair.time + S).min(next_sample);
+        if spell || elapsed + S >= bulk_end && elapsed < bulk_end {
+            t = t.min(next_beat.max(pair.time));
+        }
+        pair.time = pair.time.max(t);
+    }
+
+    let window = |from: u64, to: u64| cwnds.iter().filter(move |(t, _)| (from..to).contains(t));
+    let before = window(5, 10).map(|(_, c)| *c).max().unwrap_or(0);
+    let low = window(10, 55).map(|(_, c)| *c).min().unwrap_or(0);
+    let trace: Vec<alloc::string::String> =
+        cwnds.iter().map(|(t, c)| format!("{t}s:{c}")).collect();
+    assert!(
+        low * 16 >= before,
+        "cwnd at most {before} in the 5 s before the spell, down to {low} during it or in the 5 s \
+         after\n{}",
+        trace.join(" ")
+    );
+    Ok(())
+}
+
 const ZEROES: [u8; 10_000] = [0u8; 10_000];
 
 fn send_bytes(mut send_stream: crate::SendStream<'_>, bytes_to_send: &mut usize) -> TestResult {

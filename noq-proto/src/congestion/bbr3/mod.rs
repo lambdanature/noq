@@ -1740,7 +1740,8 @@ impl Bbr3 {
         if largest_packet_num_acked.is_some() {
             if self.app_limited != 0 && self.delivered > self.app_limited {
                 self.app_limited = 0;
-            } else if app_limited {
+            }
+            if app_limited {
                 self.app_limited = Ord::max(self.delivered + self.inflight, 1);
             }
             let round_count = self.round_count;
@@ -6991,6 +6992,119 @@ mod test {
             final_err < 0.10,
             "max_bw after subsequent probing ({max_bw_final}) should still be within 10% of the \
              simulated {BW} (rel err {final_err})"
+        );
+    }
+
+    /// An app-limited spell of heartbeats must not make BBR take the
+    /// heartbeat rate for the link's bandwidth. It did when `on_end_acks`
+    /// cleared the app-limited marker without setting it again.
+    ///
+    /// Bulk sending, then a quiet spell in which the application sends one
+    /// small packet every 500 ms (a heartbeat), then bulk sending again, on a
+    /// clean 50 Mbit/s link with a 90 ms round trip. The acks of the quiet
+    /// spell report it as app-limited, as the connection does. Compares the
+    /// bandwidth estimate (`max_bw`, bytes/s) just before the spell with its
+    /// lowest value from the start of the spell to the end of the run.
+    #[test]
+    fn an_app_limited_spell_of_heartbeats_keeps_the_bandwidth_estimate() {
+        const S: u64 = 1_000_000_000;
+        const MSS: u64 = 1200;
+        const BW: f64 = 50e6 / 8.0;
+        const RTT_NS: u64 = 90_000_000;
+        let (bulk_end, trickle_end, run_end) = (20 * S, 35 * S, 65 * S);
+        let config = Bbr3Config::default();
+        let mut sim = Sim::new(config, MSS, BW, RTT_NS);
+        let mut next_beat = bulk_end;
+        let (mut before, mut low) = (0, u64::MAX);
+        loop {
+            let trickle = (bulk_end..trickle_end).contains(&sim.now_ns);
+            if sim.now_ns >= run_end {
+                break;
+            }
+            if sim.now_ns < bulk_end {
+                before = sim.bbr.max_bw as u64;
+            } else {
+                low = low.min(sim.bbr.max_bw as u64);
+            }
+            let can_send = sim.inflight + MSS <= sim.bbr.window();
+            // When the sender wants to send next: paced in bulk, a beat in the spell.
+            let want = if trickle {
+                Some(next_beat)
+            } else {
+                Some(sim.next_send_ns.max(sim.now_ns))
+            };
+            if !can_send && !trickle {
+                sim.bbr.on_cwnd_limited();
+            }
+            let next_ack = sim.flight.front().map(|p| p.ack_ns);
+            let send_at = want.filter(|_| can_send);
+            let do_send = match (send_at, next_ack) {
+                (Some(t), Some(a)) => t <= a,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if do_send {
+                let t = send_at.unwrap();
+                // a beat due after the spell ends gives way to bulk sending
+                if trickle && t >= trickle_end {
+                    sim.now_ns = trickle_end;
+                    sim.next_send_ns = trickle_end;
+                    continue;
+                }
+                sim.now_ns = sim.now_ns.max(t);
+                let send_ns = sim.now_ns;
+                let arrival = send_ns + sim.fwd_ns;
+                let start = arrival.max(sim.btl_free_ns);
+                let finish = start + sim.btl_service_ns;
+                sim.btl_free_ns = finish;
+                let at = sim.at(send_ns);
+                sim.bbr
+                    .on_packet_sent(at, MSS as u16, sim.pn, SpaceKind::Data);
+                sim.inflight += MSS;
+                sim.flight.push_back(SimPacket {
+                    pn: sim.pn,
+                    send_ns,
+                    ack_ns: finish + sim.ret_ns,
+                });
+                sim.pn += 1;
+                if trickle {
+                    next_beat = send_ns + S / 2;
+                } else {
+                    let pacing = sim.bbr.pacing_rate.max(1.0);
+                    sim.next_send_ns = send_ns + (MSS as f64 / pacing * 1e9).round() as u64;
+                }
+            } else if let Some(p) = sim.flight.pop_front() {
+                sim.now_ns = sim.now_ns.max(p.ack_ns);
+                sim.inflight -= MSS;
+                let app_limited = (bulk_end..trickle_end).contains(&sim.now_ns);
+                sim.rtt_est
+                    .update(Duration::ZERO, Duration::from_nanos(sim.now_ns - p.send_ns));
+                let (now_at, sent_at) = (sim.at(sim.now_ns), sim.at(p.send_ns));
+                sim.bbr.on_ack(
+                    now_at,
+                    sent_at,
+                    MSS,
+                    p.pn,
+                    SpaceKind::Data,
+                    app_limited,
+                    &sim.rtt_est,
+                );
+                sim.bbr.on_end_acks(
+                    now_at,
+                    sim.inflight,
+                    app_limited,
+                    Some(p.pn),
+                    SpaceKind::Data,
+                );
+            } else if trickle {
+                sim.now_ns = next_beat.min(trickle_end);
+            } else {
+                panic!("stalled at {} ns", sim.now_ns);
+            }
+        }
+        assert!(
+            low * 2 >= before,
+            "max_bw {before} B/s before the spell, down to {low} B/s during or after it"
         );
     }
 }
